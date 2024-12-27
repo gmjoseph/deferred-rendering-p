@@ -1,0 +1,1863 @@
+<html>
+    <head>
+        <title>Instanced Rendering - WebGL</title>
+        <style>
+            body {
+                background-color: black;
+                margin: 0;
+                padding: 0;
+                position: relative;
+            }
+            #main {
+                display: flex;
+                height: 100%;
+                justify-content: center;
+                align-items: center;
+            }
+            canvas {
+                height: 100%;
+            }
+        </style>
+    </head>
+    <body>
+        <section id="main">
+            <canvas id="canvas" height="1024" width="1024"></canvas>
+        </section>
+    </body>
+    <script src="lib/dat.gui.js"></script>
+    <script src="lib/gl-matrix.js"></script>
+    <script src="assets/scifi-box.obj.js"></script>
+    <script>
+    /*
+     *
+     * https://learnopengl.com/PBR/Theory
+     * https://learnopengl.com/Advanced-Lighting/Deferred-Shading
+     * https://learnopengl.com/Advanced-Lighting/Normal-Mapping
+     * https://www.geeks3d.com/20130122/normal-mapping-without-precomputed-tangent-space-vectors/
+     * https://en.m.wikipedia.org/wiki/Physically_based_rendering
+     * http://www.paulallenrenton.com/individual-projects/webgl-deferred-renderer
+     * http://renderwonk.com/publications/s2010-shading-course/
+     * https://gist.github.com/galek/53557375251e1a942dfa
+     * https://github.com/penumbra23/PBR-Shaders/blob/master/PBR-Shaders/Assets/Shaders/PBRShader.shader
+     *
+     */
+
+    const { glMatrix } = window;
+
+    const Z_NEAR = 0.1;
+    const Z_FAR = 1000.0;
+
+    const TEXTURE_NONE = -1;
+    const TEXTURE_DIFFUSE = 0;
+    const TEXTURE_NORMAL = 1;
+    const TEXTURE_METALLIC = 2;
+    const TEXTURE_ROUGHNESS = 3;
+    const TEXTURE_POLKA_DOT = 4;
+    const TEXTURE_CHECKERBOARD = 5;
+    const TEXTURE_POLKA_DOT_STRIPES = 6;
+    const TEXTURE_STRIPES_VERTICAL = 7;
+    const TEXTURE_STRIPES_HORIZONTAL = 8;
+    const TEXTURE_OPTIONS = [
+        { name: 'No Texture', enum: TEXTURE_NONE },
+        { name: 'Diffuse', enum: TEXTURE_DIFFUSE },
+        { name: 'Normal', enum: TEXTURE_NORMAL },
+        { name: 'Metallic', enum: TEXTURE_METALLIC },
+        { name: 'Roughness', enum: TEXTURE_ROUGHNESS },
+        { name: 'Polka Dots', enum: TEXTURE_POLKA_DOT },
+        { name: 'Checkerboard', enum: TEXTURE_CHECKERBOARD },
+        { name: 'Polka Dot Stripes', enum: TEXTURE_POLKA_DOT_STRIPES },
+        { name: 'Stripes (Vertical)', enum: TEXTURE_STRIPES_VERTICAL },
+        { name: 'Stripes (Horizontal)', enum: TEXTURE_STRIPES_HORIZONTAL },
+    ];
+
+    const OUTPUT_COLOUR = 0;
+    const OUTPUT_POSITION = 1
+    const OUTPUT_UV = 2;
+    const OUTPUT_NORMAL = 3;
+    const OUTPUT_DEPTH = 4;
+    const OUTPUT_SHADED_1 = 5;
+    const OUTPUT_SHADED_2 = 8;
+    const OUTPUT_DIFFUSE_COLOUR = 6;
+    const OUTPUT_PBR = 7;
+    const OUTPUT_OPTIONS = [
+        { name: 'Shaded Phong', enum: OUTPUT_SHADED_1 },
+        { name: 'Shaded PBR', enum: OUTPUT_SHADED_2 },
+        { name: 'Colours', enum: OUTPUT_COLOUR },
+        { name: 'Diffuse Colours', enum: OUTPUT_DIFFUSE_COLOUR },
+        { name: 'Positions', enum: OUTPUT_POSITION },
+        { name: 'UVs', enum: OUTPUT_UV },
+        { name: 'Normals', enum: OUTPUT_NORMAL },
+        { name: 'PBR', enum: OUTPUT_PBR },
+        { name: 'Depth', enum: OUTPUT_DEPTH },
+    ];
+
+    const FILTER_NONE = -1;
+    const FILTER_GAUSSIAN = 10;
+    const FILTER_SHARPEN = 11;
+    const FILTER_BOX = 12;
+    const FILTER_EMBOSS = 13;
+    const FILTER_SOBEL = 14;
+    const FILTER_OPTIONS = [
+        { name: 'No Filter', enum: FILTER_NONE },
+        { name: 'Gaussian', enum: FILTER_GAUSSIAN },
+        { name: 'Sharpen', enum: FILTER_SHARPEN },
+        { name: 'Box', enum: FILTER_BOX },
+        { name: 'Emboss', enum: FILTER_EMBOSS },
+        { name: 'Sobel', enum: FILTER_SOBEL },
+    ];
+
+    const EFFECT_NONE = -1;
+    const EFFECT_PIXEL_GRID = 100;
+    const EFFECT_OUTLINE = 101;
+    const EFFECT_OPTIONS = [
+        { name: 'No Effect', enum: EFFECT_NONE },
+        { name: 'Pixel Grid', enum: EFFECT_PIXEL_GRID },
+        { name: 'Outline', enum: EFFECT_OUTLINE },
+    ];
+
+const pbrSnippet = `
+#define PI 3.1415926
+
+#define COOK
+#define COOK_GGX
+
+// constant light position, only one light source for testing (treated as point light)
+// const vec3 light_pos = vec3(-2, 3, -2);
+
+
+// handy value clamping to 0 - 1 range
+float saturate(in float value)
+{
+    return clamp(value, 0.0, 1.0);
+}
+
+
+// phong (lambertian) diffuse term
+float phong_diffuse()
+{
+    return (1.0 / PI);
+}
+
+
+// compute fresnel specular factor for given base specular and product
+// product could be NdV or VdH depending on used technique
+vec3 fresnel_factor(in vec3 f0, in float product)
+{
+    return mix(f0, vec3(1.0), pow(1.01 - product, 5.0));
+}
+
+
+// following functions are copies of UE4
+// for computing cook-torrance specular lighting terms
+
+float D_blinn(in float roughness, in float NdH)
+{
+    float m = roughness * roughness;
+    float m2 = m * m;
+    float n = 2.0 / m2 - 2.0;
+    return (n + 2.0) / (2.0 * PI) * pow(NdH, n);
+}
+
+float D_beckmann(in float roughness, in float NdH)
+{
+    float m = roughness * roughness;
+    float m2 = m * m;
+    float NdH2 = NdH * NdH;
+    return exp((NdH2 - 1.0) / (m2 * NdH2)) / (PI * m2 * NdH2 * NdH2);
+}
+
+float D_GGX(in float roughness, in float NdH)
+{
+    float m = roughness * roughness;
+    float m2 = m * m;
+    float d = (NdH * m2 - NdH) * NdH + 1.0;
+    return m2 / (PI * d * d);
+}
+
+float G_schlick(in float roughness, in float NdV, in float NdL)
+{
+    float k = roughness * roughness * 0.5;
+    float V = NdV * (1.0 - k) + k;
+    float L = NdL * (1.0 - k) + k;
+    return 0.25 / (V * L);
+}
+
+
+// simple phong specular calculation with normalization
+vec3 phong_specular(in vec3 V, in vec3 L, in vec3 N, in vec3 specular, in float roughness)
+{
+    vec3 R = reflect(-L, N);
+    float spec = max(0.0, dot(V, R));
+
+    float k = 1.999 / (roughness * roughness);
+
+    return min(1.0, 3.0 * 0.0398 * k) * pow(spec, min(10000.0, k)) * specular;
+}
+
+// simple blinn specular calculation with normalization
+vec3 blinn_specular(in float NdH, in vec3 specular, in float roughness)
+{
+    float k = 1.999 / (roughness * roughness);
+    
+    return min(1.0, 3.0 * 0.0398 * k) * pow(NdH, min(10000.0, k)) * specular;
+}
+
+// cook-torrance specular calculation                      
+vec3 cooktorrance_specular(in float NdL, in float NdV, in float NdH, in vec3 specular, in float roughness, in float rimLighting)
+{
+#ifdef COOK_BLINN
+    float D = D_blinn(roughness, NdH);
+#endif
+
+#ifdef COOK_BECKMANN
+    float D = D_beckmann(roughness, NdH);
+#endif
+
+#ifdef COOK_GGX
+    float D = D_GGX(roughness, NdH);
+#endif
+
+    float G = G_schlick(roughness, NdV, NdL);
+
+    float rim = mix(1.0 - roughness * rimLighting * 0.9, 1.0, NdV);
+
+    return (1.0 / rim) * specular * G * D;
+}
+
+                      
+vec3 lighting_pbr(vec3 base_colour, vec3 position, vec3 normal, vec2 pbr, vec3 light_pos) {
+    // Incoming light_pos is model space.
+
+    // light attenuation
+    float A = 20.0 / dot(light_pos - position, light_pos - position);
+
+    // L, V, H vectors
+    vec3 L = normalize(light_pos - position);
+    vec3 V = normalize(u_camera_position - position);
+    vec3 H = normalize(L + V);
+    vec3 nn = normalize(normal);
+
+    // I default to normal map is used, but that's something we get back upstream
+    vec3 N = nn;
+    vec3 base = base_colour;
+    //     // roughness
+    // #if USE_ROUGHNESS_MAP
+    //     float roughness = texture2D(spec, texcoord).y * material.y;
+    float roughness = pbr.g;
+    float metallic = pbr.r;
+
+    // mix between metal and non-metal material, for non-metal
+    // constant base specular factor of 0.04 grey is used
+    vec3 specular = mix(vec3(0.04), base, metallic);
+
+    // // diffuse IBL term
+    // //    I know that my IBL cubemap has diffuse pre-integrated value in 10th MIP level
+    // //    actually level selection should be tweakable or from separate diffuse cubemap
+    // mat3x3 tnrm = transpose(normal_matrix);
+    // vec3 envdiff = textureCubeLod(envd, tnrm * N, 10).xyz;
+
+    // // specular IBL term
+    // //    11 magic number is total MIP levels in cubemap, this is simplest way for picking
+    // //    MIP level from roughness value (but it's not correct, however it looks fine)
+    // vec3 refl = tnrm * reflect(-V, N);
+    // vec3 envspec = textureCubeLod(
+    //     envd, refl, max(roughness * 11.0, textureQueryLod(envd, refl).y)
+    // ).xyz;
+
+    // compute material reflectance
+
+    float NdL = max(0.0, dot(N, L));
+    float NdV = max(0.001, dot(N, V));
+    float NdH = max(0.001, dot(N, H));
+    float HdV = max(0.001, dot(H, V));
+    float LdV = max(0.001, dot(L, V));
+
+    // fresnel term is common for any, except phong
+    // so it will be calcuated inside ifdefs
+
+#ifdef PHONG
+    // specular reflectance with PHONG
+    vec3 specfresnel = fresnel_factor(specular, NdV);
+    vec3 specref = phong_specular(V, L, N, specfresnel, roughness);
+#endif
+
+#ifdef BLINN
+    // specular reflectance with BLINN
+    vec3 specfresnel = fresnel_factor(specular, HdV);
+    vec3 specref = blinn_specular(NdH, specfresnel, roughness);
+#endif
+
+#ifdef COOK
+    // specular reflectance with COOK-TORRANCE
+    vec3 specfresnel = fresnel_factor(specular, HdV);
+    // Hasn't been calculated yet.
+    // float rimLighting = pbr.w;
+    float rimLighting = 1.;
+    vec3 specref = cooktorrance_specular(NdL, NdV, NdH, specfresnel, roughness, rimLighting);
+#endif
+
+    specref *= vec3(NdL);
+
+    // diffuse is common for any model
+    vec3 diffref = (vec3(1.0) - specfresnel) * phong_diffuse() * NdL;
+    
+    // compute lighting
+    vec3 reflected_light = vec3(0.0);
+    vec3 diffuse_light = vec3(0.15); // initial value == constant ambient light
+
+    // point light
+    // vec3 light_color = vec3(1.0) * A;
+    // Remove attenuation
+    vec3 light_color = vec3(1.0);
+    reflected_light += specref * light_color;
+    diffuse_light += diffref * light_color;
+
+    // IBL lighting
+    // vec2 brdf = texture2D(iblbrdf, vec2(roughness, 1.0 - NdV)).xy;
+    // vec3 iblspec = min(vec3(0.99), fresnel_factor(specular, NdV) * brdf.x + brdf.y);
+    // reflected_light += iblspec * envspec;
+    // diffuse_light += envdiff * (1.0 / PI);
+    // Can bring out the blue outline, but it's too much like the diffuse colour
+    // and has no highlight impact.
+    // diffuse_light += 0.9 * (1.0 / PI);
+
+    // final result
+    vec3 result = diffuse_light * mix(base, vec3(0.0), metallic) + reflected_light;
+    return result;
+}
+
+vec3 lighting_pbr_all_lights(vec3 base_colour, vec3 position, vec3 normal, vec2 pbr) {
+    vec3 colour = vec3(0.);
+
+    for (int i = 0; i < LIGHTS.length(); i++) {
+        Light light = LIGHTS[i];
+        // Need to light position so we negate it.
+        colour += lighting_pbr(base_colour, position, normal, pbr, -light.position);
+    }
+
+    return colour;
+}
+`
+
+    // Good combos:
+    // Shaded + Sobel + (Checkerboard | Polka Dots | Diffuse) etc.
+    // plus applying different scale.
+    const SHADERS =  {
+        phong: {
+            vertex: `#version 300 es
+                precision highp float;
+                uniform mat4 u_model_matrix;
+                uniform mat4 u_view_matrix;
+                uniform mat4 u_projection_matrix;
+                uniform float u_time;
+                uniform bool u_animate_camera;
+                uniform bool u_animate_y;
+                uniform int u_instance_total;
+
+                in vec3 a_position;
+                in vec2 a_uv;
+                in vec3 a_normal;
+                in vec3 a_instance_translation;
+                in vec3 a_instance_rotation;
+
+                out vec4 v_position;
+                out vec4 v_uv;
+                out vec4 v_normal;
+
+                void rotX(inout mat4 r, float angle) {
+                    r[1][1] = cos(angle);
+                    r[1][2] = sin(angle);
+                    r[2][1] = -sin(angle);
+                    r[2][2] = cos(angle);
+                }
+
+                void rotY(inout mat4 r, float angle) {
+                    r[0][0] = cos(angle);
+                    r[0][2] = sin(angle);
+                    r[2][0] = -sin(angle);
+                    r[2][2] = cos(angle);
+                }
+
+                void rotZ(inout mat4 r, float angle) {
+                    r[0][0] = cos(angle);
+                    r[0][1] = sin(angle);
+                    r[1][0] = -sin(angle);
+                    r[1][1] = cos(angle);
+                }
+
+                void main(void) {
+                    // This but for R4:
+                    // https://en.wikipedia.org/wiki/Rotation_matrix#Basic_rotations
+                    mat4 rotationX = mat4(1.);
+                    mat4 rotationY = mat4(1.);
+                    mat4 rotationZ = mat4(1.);
+
+                    rotX(rotationX, a_instance_rotation.x);
+                    rotY(rotationY, a_instance_rotation.y);
+                    rotZ(rotationZ, a_instance_rotation.z);
+
+                    // Row-major
+                    mat4 translation = mat4(1.);
+                    translation[3].xyz = a_instance_translation;
+
+                    // Awesome way to bump things up and down. Because it depends on
+                    // instance id, it is consistent across all position values for
+                    // the instance. 1 is added for instance id 0, which would just result in
+                    // a permanent sin of 0.
+                    if (u_animate_y) {
+                        translation[3][1] += sin(u_time * float(gl_InstanceID + 1)) + cos(u_time * float(u_instance_total - gl_InstanceID + 1));
+                    }
+
+                    mat4 rotation = rotationZ * rotationY * rotationX;
+                    mat4 MTR = translation * rotation * u_model_matrix;
+
+                    // We reuse this quite a bit so do it once:
+                    if (u_animate_camera) {
+                        // Disable x, z to orbit around origin.
+                        rotX(rotationX, u_time);
+                        rotY(rotationY, u_time);
+                        rotZ(rotationZ, u_time);
+                        mat4 camera_rotation = rotationZ * rotationY * rotationX;
+                        // Let scaling from the model matrix happen first.
+                        MTR = camera_rotation * MTR;
+                    }
+
+                    v_position = MTR * vec4(a_position, 1.);
+                    v_uv = vec4(a_uv, 0., 0.);
+                    v_normal = MTR * vec4(a_normal, 0.);
+
+                    gl_Position = u_projection_matrix * u_view_matrix * MTR * vec4(a_position, 1.);
+                }
+            `,
+            fragment: `#version 300 es
+                precision highp float;
+                uniform sampler2D u_texture_diffuse;
+                uniform sampler2D u_texture_normal;
+                uniform sampler2D u_texture_metallic;
+                uniform sampler2D u_texture_roughness;
+                uniform mat4 u_view_matrix;
+                uniform int u_use_texture;
+                uniform vec3 u_colour;
+                uniform float u_opacity;
+
+                in vec4 v_position;
+                in vec4 v_uv;
+                in vec4 v_normal;
+
+                layout(location = 0) out vec4 position;
+                layout(location = 1) out vec4 uv;
+                layout(location = 2) out vec4 normal;
+                layout(location = 3) out vec4 diffuse;
+                layout(location = 4) out vec4 pbr;
+
+                vec3 polka_dots(vec2 point) {
+                    // mx and my are now some value between 0 and size.
+                    float size = 0.2;
+                    float half_size = size * 0.5;
+                    vec2 modPoint = mod(point, size);
+
+                    // Shift to centre of the quadrant, since it's been divided into 4
+                    vec2 centre = vec2(half_size);
+                    float d = distance(centre, modPoint);
+
+                    // controls how big the circles will be
+                    float radius = half_size * 0.5;
+                    if (radius < d) {
+                        return vec3(1.);
+                    }
+
+                    // Smoothes the intersection between the polkadot and the returned background
+                    // because we slowly blendly between white and red as we apporach the radius
+                    // boundary.
+                    float stepped = 1. - smoothstep(0.2, 0.3, abs(radius - d) / radius);
+                    return vec3(1., stepped, stepped);
+                }
+
+                vec3 striped_polka_dots(vec2 point) {
+                    // mx and my are now some value between 0 and size.
+                    float size = 0.2;
+                    float half_size = size * 0.5;
+                    vec2 modPoint = mod(point, size);
+
+                    // Shift to centre of the quadrant, since it's been divided into 4
+                    vec2 centre = vec2(half_size);
+                    float d = distance(centre, modPoint);
+
+                    // controls how big the circles will be
+                    float radius = half_size * 0.5;
+
+                    // controls the stripe staggering.
+                    // we take double the size because the circle occupies this entire row.
+                    // if we're above half the doubled size, we're technically on another row.
+                    float colour = mod(point.y, size * 2.0) > size ? 1. : 0.;
+
+                    if (radius < d) {
+                        return vec3(1. - colour);
+                    }
+                    return vec3(colour);
+                }
+
+                vec3 checkerboard(vec2 point) {
+                    // mx and my are now some value between 0 and size.
+                    float size = 0.2;
+                    float half_size = size * 0.5;
+                    float mx = mod(point.x, size);
+                    float my = mod(point.y, size);
+
+                    // tracking even/odd rows lets us stagger the colour like a proper checkerboard
+                    // without doing this, we get stripes.
+                    // even rows
+                    // if it's > half_size, choose an even row, otherwise use an odd row.
+                    float colour = my > half_size ? 1. : 0.;
+
+                    if (mx > half_size) {
+                        return vec3(1. - colour);
+                    }
+                    return vec3(colour);
+                }
+
+                vec3 stripes(vec2 point, int direction) {
+                    // 0 for horizontal, 1 for vertical.
+                    // mx and my are now some value between 0 and size.
+                    float size = 0.05;
+                    float half_size = size * 0.5;
+                    float mx = mod(point.x, size);
+                    float my = mod(point.y, size);
+
+                    // tracking even/odd rows lets us stagger the colour like a proper checkerboard
+                    // without doing this, we get stripes.
+                    // even rows
+                    // if it's > half_size, choose an even row, otherwise use an odd row.
+
+                    if ((mx > half_size && direction == 0) ||  (my > half_size && direction == 1)) {
+                        return vec3(1.);
+                    }
+
+                    return vec3(0.);
+                }
+
+                vec3 get_texture(vec3 base_colour, vec2 v_world_uv) {
+                    // Just scale the point up if we want more repetition from the texture.
+                    float scale = 5.;
+
+                    // Use this to 'scroll' the texture over the shape, since it will keep
+                    // using rotated values to sample from the boxmap.
+                    vec2 uv = v_world_uv * scale;
+                    vec3 colour = base_colour;
+
+                    switch (u_use_texture) {
+                        case ${TEXTURE_DIFFUSE}: colour = texture(u_texture_diffuse, v_world_uv).xyz; break;
+                        case ${TEXTURE_NORMAL}: colour = texture(u_texture_normal, v_world_uv).xyz; break;
+                        case ${TEXTURE_METALLIC}: colour = texture(u_texture_metallic, v_world_uv).xyz; break;
+                        case ${TEXTURE_ROUGHNESS}: colour = texture(u_texture_roughness, v_world_uv).xyz; break;
+                        case ${TEXTURE_POLKA_DOT}: colour = polka_dots(uv); break;
+                        case ${TEXTURE_CHECKERBOARD}: colour = checkerboard(uv); break;
+                        case ${TEXTURE_POLKA_DOT_STRIPES}: colour = striped_polka_dots(uv); break;
+                        case ${TEXTURE_STRIPES_VERTICAL}: colour = stripes(uv, 1); break;
+                        case ${TEXTURE_STRIPES_HORIZONTAL}: colour = stripes(uv, 0); break;
+                    }
+
+                    return colour;
+                }
+
+                // https://www.geeks3d.com/20130122/normal-mapping-without-precomputed-tangent-space-vectors/
+                // http://www.thetenthplanet.de/archives/1180
+                mat3 cotangent_frame(vec3 N, vec3 p, vec2 uv)
+                {
+                    // get edge vectors of the pixel triangle
+                    vec3 dp1 = dFdx( p );
+                    vec3 dp2 = dFdy( p );
+                    vec2 duv1 = dFdx( uv );
+                    vec2 duv2 = dFdy( uv );
+                
+                    // solve the linear system
+                    vec3 dp2perp = cross( dp2, N );
+                    vec3 dp1perp = cross( N, dp1 );
+                    vec3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+                    vec3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+                
+                    // construct a scale-invariant frame 
+                    float invmax = inversesqrt( max( dot(T,T), dot(B,B) ) );
+                    return mat3( T * invmax, B * invmax, N );
+                }
+
+                // https://www.geeks3d.com/20130122/normal-mapping-without-precomputed-tangent-space-vectors/
+                vec3 perturb_normal( vec3 N, vec3 V, vec2 texcoord )
+                {
+                    // assume N, the interpolated vertex normal and 
+                    // V, the view vector (vertex to eye)
+                    vec3 map = texture(u_texture_normal, texcoord ).xyz;
+                    // Normals in the map were mapped from [0, 1], but that encodes values ranging from [-1, 1].
+                    // As a result, we transform it back form [0, 1] to [-1, 1] here.
+                    map = map * 2. - 1.;
+                    mat3 TBN = cotangent_frame(N, -V, texcoord);
+
+                    // I believe this puts the normal map from its tangent space into the world space,
+                    // since the input normals and the input viewer-to-vertex were both all done in
+                    // world space.
+                    return normalize(TBN * map);
+                }
+
+                void main (void) {
+                    position = v_position;
+                    uv = v_uv;
+                    // If we don't want to use the normal map.
+                    // normal = vec4(normalize(v_normal.xyz), 0.);
+                    vec3 vertex_to_eye = u_view_matrix[3].xyz - position.xyz;
+                    vec3 normal_from_normal_map = perturb_normal(normalize(v_normal.xyz), vertex_to_eye, uv.xy);
+                    normal = vec4(normal_from_normal_map, 1.);
+
+                    diffuse = vec4(get_texture(u_colour, v_uv.xy), u_opacity);
+
+                    // They're both greyscale, so we only need one channel each.
+                    pbr.r = texture(u_texture_metallic, v_uv.xy).r;
+                    pbr.g = texture(u_texture_roughness, v_uv.xy).r;
+                    //  Placeholder for storing other things in the pbr texture.
+                    pbr.ba = vec2(0.);
+
+                    // If we turn deferred rendering off, we see the 0th buffer or the default
+                    // colour attachment.
+                    // Debug uvs
+                    // position = v_uv
+                    // Debug normals
+                    // position = vec4(abs(normal.xyz), 1.);
+                    // Debug diffuse
+                    // position = diffuse;
+                }
+            `,
+            uniforms: [
+                'u_texture_diffuse',
+                'u_texture_normal',
+                'u_texture_metallic',
+                'u_texture_roughness',
+                'u_model_matrix',
+                'u_view_matrix',
+                'u_projection_matrix',
+                'u_colour',
+                'u_opacity',
+                'u_use_texture',
+                'u_time',
+                'u_animate_camera',
+                'u_animate_y',
+                'u_instance_total',
+            ],
+            attributes: [
+                'a_position',
+                'a_uv',
+                'a_normal',
+                'a_instance_translation',
+                'a_instance_rotation',
+            ],
+        },
+        quad: {
+            vertex: `#version 300 es
+                precision highp float;
+                in vec2 a_position;
+
+                void main(void) {
+                    gl_Position = vec4(a_position, 0., 1.);
+                }
+            `,
+            fragment: `#version 300 es
+                precision highp float;
+                uniform sampler2D u_buffer_position;
+                uniform sampler2D u_buffer_uv;
+                uniform sampler2D u_buffer_normal;
+                uniform sampler2D u_buffer_diffuse;
+                uniform sampler2D u_buffer_pbr;
+                uniform sampler2D u_buffer_depth;
+
+                uniform vec3 u_camera_position;
+                uniform vec3 u_colour;
+                uniform int u_use_output;
+                uniform int u_use_filter;
+                uniform int u_use_effect;
+
+                out vec4 colour;
+
+                struct Light {
+                    vec3 position;
+                    float intensity;
+                };
+
+                Light LIGHTS[] = Light[](
+                    // TODO
+                    // coords are inverted for some reason.
+                    // top centre,
+                    Light(vec3(-5, -20., 0.), 0.85),
+                    // bottom right front
+                    Light(vec3(0., 0., -20.), 0.1)
+                    // front right or left
+                    // Light(vec3(-10., 0., 10), 0.7)
+                );
+
+                vec4 colour_at(ivec2 frag_coord, int use_input);
+
+                ${pbrSnippet}
+
+                vec3 lighting_phong(vec3 base_colour, vec3 position, vec3 normal) {
+                    // We use frag_coord and not uv here because uv is only good for sampling in textures.
+                    // We need the full size frag_coord to sample from the buffers we have.
+
+                    // TODO
+                    // https://gist.github.com/galek/53557375251e1a942dfa
+                    vec3 colour = vec3(0.);
+                    vec3 camera_position = u_camera_position;
+
+                    for (int i = 0; i < LIGHTS.length(); i++) {
+                        Light light = LIGHTS[i];
+                        vec3 light_to_vertex = normalize(position - light.position);
+
+                        // https://www.cs.toronto.edu/~jacobson/phong-demo/
+                        // Lambert's cosine law
+                        float lambertian = max(dot(normal, light_to_vertex), 0.0);
+                        float specular = 0.0;
+                        float shininess_value = 2048.;
+                        if (lambertian > 0.0) {
+                            // Reflected light vector
+                            vec3 reflection = reflect(-light_to_vertex, normal);
+                            // Vector to viewer
+                            vec3 vector_to_camera = normalize(camera_position - position);
+                            // Compute the specular term
+                            float specular_angle = max(dot(reflection, vector_to_camera), 0.0);
+                            specular = pow(specular_angle, shininess_value);
+                        }
+                        
+                        float Kd = light.intensity;
+                        float Ka = 0.05;
+                        float Ks = light.intensity;
+
+                        // Metallic is in the r channel.
+                        vec3 working_colour = base_colour;
+                        vec3 ambient_colour = working_colour.xyz;
+                        vec3 specular_colour = base_colour;
+                        
+                        colour += vec3(
+                            Ka * ambient_colour +
+                            Kd * lambertian * working_colour +
+                            Ks * specular * specular_colour
+                        );
+                    }
+
+                    return colour;
+                }
+
+                float luminance(vec3 colour) {
+                    return 0.2126 * colour.r + 0.7152 * colour.g + 0.0722 * colour.b;
+                }
+
+                vec3 apply_filter(vec3 base_colour, ivec2 frag_coord, int use_input) {
+                    // Sample surrounding texels.
+                    ivec2 offset = ivec2(1, 1);
+                    ivec2 offset_frag_coords[9] = ivec2[9](
+                        // top left
+                        frag_coord - offset,
+                        // top
+                        ivec2(frag_coord.x, frag_coord.y - offset.y),
+                        // top right
+                        ivec2(frag_coord.x + offset.x, frag_coord.y - offset.y),
+                        // left
+                        ivec2(frag_coord.x - offset.x, frag_coord.y),
+                        // centre
+                        frag_coord,
+                        // right
+                        ivec2(frag_coord.x + offset.x, frag_coord.y),
+                        // bottom left
+                        ivec2(frag_coord.x - offset.x, frag_coord.y + offset.y),
+                        // bottom
+                        ivec2(frag_coord.x, frag_coord.y + offset.y),
+                        // bottom right
+                        frag_coord + offset
+                    );
+
+                    float convolution_matrix[9];
+
+                    if (${FILTER_GAUSSIAN} == u_use_filter) {
+                        convolution_matrix = float[9](
+                            0.0625, 0.125, 0.0625,
+                            0.125, 0.25, 0.125,
+                            0.0625, 0.125, 0.0625
+                        );
+                    } else if (${FILTER_SHARPEN} == u_use_filter) {
+                        convolution_matrix = float[9](
+                            0.0, -1.0, 0.0,
+                            -1.0, 5.0, -1.0,
+                            0.0, -1.0, 0.0
+                        );
+                    } else if (${FILTER_BOX} == u_use_filter) {
+                        convolution_matrix = float[9](
+                            0.11111, 0.11111, 0.11111,
+                            0.11111, 0.11111, 0.11111,
+                            0.11111, 0.11111, 0.11111
+                        );
+                    } else if (${FILTER_EMBOSS} == u_use_filter) {
+                        convolution_matrix = float[9](
+                            -2.0, -1.0, 0.0,
+                            -1.0, 1.0, 1.0,
+                            0.0, 1.0, 2.0
+                        );
+                    }
+
+                    vec3 colour = vec3(0.0, 0.0, 0.0);
+
+                    for (int i = 0; i < convolution_matrix.length(); i++) {
+                        ivec2 next_frag_coord = offset_frag_coords[i];
+                        colour += colour_at(next_frag_coord, use_input).rgb * convolution_matrix[i];
+                    }
+                    return colour;
+                }
+
+                vec3 apply_filter_sobel(vec3 base_colour, ivec2 frag_coord, int use_input) {
+                    // Sample surrounding texels.
+                    ivec2 offset = ivec2(1, 1);
+
+                    // // "Seeing doubles".
+                    // offset.x = 10;
+                    // offset.y = 0;
+
+                    ivec2 offset_frag_coords[9] = ivec2[9](
+                        // top left
+                        frag_coord - offset,
+                        // top
+                        ivec2(frag_coord.x, frag_coord.y - offset.y),
+                        // top right
+                        ivec2(frag_coord.x + offset.x, frag_coord.y - offset.y),
+                        // left
+                        ivec2(frag_coord.x - offset.x, frag_coord.y),
+                        // centre
+                        frag_coord,
+                        // right
+                        ivec2(frag_coord.x + offset.x, frag_coord.y),
+                        // bottom left
+                        ivec2(frag_coord.x - offset.x, frag_coord.y + offset.y),
+                        // bottom
+                        ivec2(frag_coord.x, frag_coord.y + offset.y),
+                        // bottom right
+                        frag_coord + offset
+                    );
+
+                    float convolution_matrix_x[9] = float[9](
+                        -1.0, 0.0, 1.0,
+                        -2.0, 0.0, 2.0,
+                        -1.0, 0.0, 1.0
+                    );
+
+                    float convolution_matrix_y[9] = float[9](
+                        -1.0, -2.0, -1.0,
+                        0.0, 0.0, 0.0,
+                        1.0, 2.0, 1.0
+                    );
+
+                    vec3 colour = vec3(0.0, 0.0, 0.0);
+
+                    vec2 gradient = vec2(0.);
+
+                    for (int i = 0; i < offset_frag_coords.length(); i++) {
+                        // Sample surrounding data to get lighting in the region.
+                        ivec2 next_frag_coord = offset_frag_coords[i];
+                        vec3 next_colour = colour_at(next_frag_coord, use_input).rgb;
+
+                        float lum = luminance(next_colour);
+                        gradient += (vec2(convolution_matrix_x[i], convolution_matrix_y[i]) * lum);
+                    }
+                    
+                    float mag = length(gradient);
+                    return vec3(mag);
+                }
+
+                vec4 apply_effect_pixel_grid(ivec2 frag_coord, int use_input) {
+                    // https://github.com/sketchpunk/FunWithWebGL2/blob/de4f8e919056196b422cd6cd406cdd0ccf279f48/lesson_061/fungi/shaders/deferred/DeferredRender.txt
+                    float pixel_size = 7.0;
+                    float x_mod		= mod(float(frag_coord.x), pixel_size);
+                    float y_mod		= mod(float(frag_coord.y), pixel_size);
+
+                    if (x_mod == 0.0 || y_mod == 0.0) {
+                        return vec4(0.0, 0.0, 0.0, 0.3);
+                    } else {
+                        ivec2 next_frag_coord = frag_coord;
+                        next_frag_coord.x -= int( x_mod );
+                        next_frag_coord.y -= int( y_mod );
+                        // Need to fetch with the modded value.
+                        return colour_at(next_frag_coord, use_input);
+                    }
+                }
+
+                float linearize_depth(float z) {
+                    // https://github.com/sketchpunk/FunWithWebGL2/blob/de4f8e919056196b422cd6cd406cdd0ccf279f48/lesson_061/fungi/shaders/deferred/DeferredRender.txt#L49
+                    float n = float(${Z_NEAR}); // camera z near
+                    float f = float(${Z_FAR}); // camera z far
+                    return (2.0 * n) / (f + n - z * (f - n));	
+	            }
+
+                vec4 colour_at(ivec2 frag_coord, int use_output) {
+                    // Everything should get the right colour from here, not try to
+                    // determine it on its own using a frag_coord.
+
+                    vec3 position = texelFetch(u_buffer_position, frag_coord, 0).rgb;
+
+                    vec2 uv = texelFetch(u_buffer_uv, frag_coord, 0).xy;
+
+                    // Invert the normal direction to get bounce back IIRC. Only do this for the normal map.
+                    // vec3 normal = -texelFetch(u_buffer_normal, frag_coord, 0).rgb;
+                    vec3 normal = texelFetch(u_buffer_normal, frag_coord, 0).rgb;
+
+                    vec4 diffuse = texelFetch(u_buffer_diffuse, frag_coord, 0).rgba;
+
+                    // Depth is in the red channel.
+                    float depth = texelFetch(u_buffer_depth, frag_coord, 0).r;
+                    depth = linearize_depth(depth);
+                    
+                    // Metallic in r, roughness in g. b and a are reserved (0 now).
+                    vec2 pbr = texelFetch(u_buffer_pbr, frag_coord, 0).rg;
+
+                    vec4 colour = vec4(1.);
+
+                    // Compositing
+                    // colour += diffuse * 0.05;
+
+                    // Gradient?
+                    // float grad = length(step(0.05, cross(dFdx(position), dFdy(position)) * 10.));
+                    // colour.rgb = vec3(grad);
+                    // colour = texelFetch(u_buffer_normal, frag_coord, 0);
+
+                    switch (use_output) {
+                        // Cut at diffuse edge since it's surrounded by black. This makes it
+                        // entirely white inside (so duotone)
+                        case ${OUTPUT_COLOUR}: colour = step(0.000000001, diffuse); break;
+                        case ${OUTPUT_DIFFUSE_COLOUR}: colour = diffuse; break;
+                        case ${OUTPUT_POSITION}: colour.rgb = position; break;
+                        case ${OUTPUT_UV}: colour.rgb = vec3(uv, 1.); break;
+                        // Undo the inversion for debugging.
+                        case ${OUTPUT_NORMAL}: colour.rgb = abs(normal); break;
+                        case ${OUTPUT_PBR}: colour.rgb = vec3(pbr.rg, 0.); break;
+                        case ${OUTPUT_SHADED_1}: colour.rgb = lighting_phong(diffuse.xyz, position, normalize(normal)); break;
+                        case ${OUTPUT_SHADED_2}: colour.rgb = lighting_pbr_all_lights(diffuse.xyz, position, normalize(normal), pbr); break;
+                        case ${OUTPUT_DEPTH}: colour.rgb = vec3(depth); break;
+                    }
+                    return colour;
+                }
+
+                void main(void) {
+                    ivec2 frag_coord = ivec2(gl_FragCoord.xy);
+                    colour = colour_at(frag_coord, u_use_output);
+
+                    // Effects then filters. This order is arbitrary might be nice to switch on demand.
+                    // TODO
+                    // They don't play nicely together because the pixel grid impacts the frag_coord
+                    // but then the filters reuse the non-modded frag coord so it removes the effect.
+
+                    switch (u_use_effect) {
+                        case ${EFFECT_PIXEL_GRID}:
+                            colour = apply_effect_pixel_grid(frag_coord, u_use_output); break;
+                        case ${EFFECT_OUTLINE}:
+                            // Draw a sobel around the colour-only output.
+                            colour.rgb += apply_filter_sobel(colour.rgb, frag_coord, ${OUTPUT_COLOUR}); break;
+                    }
+
+                    switch (u_use_filter) {
+                        case ${FILTER_BOX}:
+                        case ${FILTER_EMBOSS}:
+                        case ${FILTER_GAUSSIAN}:
+                        case ${FILTER_SHARPEN}:
+                            colour.rgb = apply_filter(colour.rgb, frag_coord, u_use_output); break;
+                        case ${FILTER_SOBEL}:
+                            colour.rgb = apply_filter_sobel(colour.rgb, frag_coord, u_use_output); break;
+                    }
+
+                }
+            `,
+            uniforms: [
+                'u_buffer_position',
+                'u_buffer_uv',
+                'u_buffer_normal',
+                'u_buffer_diffuse',
+                'u_buffer_pbr',
+                'u_buffer_depth',
+                'u_camera_position',
+                'u_colour',
+                'u_use_output',
+                'u_use_effect',
+                'u_use_filter',
+            ],
+            attributes: [
+                'a_position',
+            ],
+        }
+    };
+
+    async function loadImage(imageData) {
+        return new Promise((resolve, reject) => {
+            const img = new Image();
+            img.onload = () => resolve(img);
+            img.onerror = reject;
+            img.src = imageData;
+        });
+    }
+
+    class Shader {
+        constructor(gl, vertCode, fragCode) {
+            this.program = null;
+            this.setupShader(gl, vertCode, fragCode);
+        }
+
+        setupShader(gl, vertCode, fragCode) {
+            const log = (shader) => {
+                const compiled = gl.getShaderParameter(shader, gl.COMPILE_STATUS);
+                if (!compiled) {
+                    console.log('Shader compiled failed: ' + compiled);
+                
+                    const compilationLog = gl.getShaderInfoLog(shader);
+                    console.log('Shader compiler log: ' + compilationLog);
+                }
+            };
+
+            const vertShader = gl.createShader(gl.VERTEX_SHADER);
+            gl.shaderSource(vertShader, vertCode);
+            gl.compileShader(vertShader);
+            log(vertShader);
+            
+        
+            const fragShader = gl.createShader(gl.FRAGMENT_SHADER);
+            gl.shaderSource(fragShader, fragCode); 
+            gl.compileShader(fragShader);
+            log(fragShader);
+            
+            const shaderProgram = gl.createProgram();
+            gl.attachShader(shaderProgram, vertShader);
+            gl.attachShader(shaderProgram, fragShader);
+            gl.linkProgram(shaderProgram);
+
+            this.program = shaderProgram
+        }
+
+        cacheUniformLocations(gl, uniformNames) {
+            uniformNames.forEach(name => {
+                const key = `${name}Location`;
+                this[key] = gl.getUniformLocation(this.program, name);
+            });
+        }
+
+        cacheAttributeLocations(gl, attributeNames) {
+            attributeNames.forEach(name => {
+                const key = `${name}Location`;
+                const location = gl.getAttribLocation(this.program, name);
+                this[key] = location;
+            });
+        }
+
+        debugAttributes(gl) {
+            const { program } = this;
+            const numAttribs = gl.getProgramParameter(program, gl.ACTIVE_ATTRIBUTES);
+                for (let i = 0; i < numAttribs; ++i) {
+                const info = gl.getActiveAttrib(program, i);
+                console.log('name:', info.name, 'type:', info.type, 'size:', info.size);
+            }
+        }
+    }
+
+    class Mesh {
+        static Identifiers = {
+            Vert: 'v',
+            Texture: 'vt',
+            Normal: 'vn',
+            GroupName: 'g',
+            SmoothGroup: 's',
+            Face: 'f',
+        };
+
+        static KnownIdentifiers = new Set(
+            Object.keys(Mesh.Identifiers).reduce(
+                (a, key) => ([...a, (Mesh.Identifiers[key])]), []
+            )
+        );
+
+        constructor(obj) {
+            // Rendering data.
+            this.colour = [1, 1, 1];
+            this.opacity = 1;
+            this.scale = 1;
+            this.useTexture = TEXTURE_DIFFUSE;
+            this.debugNormals = false;
+
+            const { mat4 } = glMatrix;
+            this.modelMatrix = mat4.create();
+            this.handleScale();
+
+            this.obj = {
+                index: 0,
+                // Inputs from the obj.
+                vertsIn: [],
+                uvsIn: [],
+                normalsIn: [],
+                // Outputs to render.
+                pointIndices: {},
+                verts: [],
+                uvs: [],
+                normals: [],
+                indices: [],
+            };
+
+            this.bounds = {
+                minX: Number.MAX_SAFE_INTEGER,
+                maxX: Number.MIN_SAFE_INTEGER,
+                minY: Number.MAX_SAFE_INTEGER,
+                maxY: Number.MIN_SAFE_INTEGER,
+                minZ: Number.MAX_SAFE_INTEGER,
+                maxZ: Number.MIN_SAFE_INTEGER,
+            }
+
+            // Populates this.obj based on an input 'obj' file.
+            const lines = obj.split(/[\r\n]+/);
+            this.parse(lines);
+
+            this.gl = {
+                vao: null,
+                positions: {
+                    data: new Float32Array(this.obj.verts),
+                    buffer: null,
+                },
+                uvs: {
+                    data: new Float32Array(this.obj.uvs),
+                    buffer: null,
+                },
+                normals: {
+                    data: new Float32Array(this.obj.normals),
+                    buffer: null,
+                },
+                indices: {
+                    data: new Uint32Array(this.obj.indices),
+                    buffer: null,
+                },
+            };
+
+            this.textures = {
+                diffuse: null,
+                normal: null,
+                metallic: null,
+                roughness: null,
+            };
+
+            this.instancing = {
+                data: null,
+                buffer: null,
+                count: 4,
+            };
+        }
+
+        getVec2(tokens) {
+            return [
+                parseFloat(tokens[0]),
+                parseFloat(tokens[1]),
+            ];
+        }
+
+        getVec3(tokens) {
+            const vec = this.getVec2(tokens);
+            vec.push(parseFloat(tokens[2]));
+            return vec;
+        }
+
+        getPoint(token) {
+            // each token is a potential set of v/vt/vn indices.
+            return token.split(/\//).map(v => parseInt(v));
+        }
+
+        parse(lines) {
+            for (let i = 0; i < lines.length; i++) {
+                const tokens = lines[i].split(/\s+/);
+
+                if (0 === tokens.length) {
+                    continue;
+                }
+
+                const identifier = tokens.shift();
+
+                if (!Mesh.KnownIdentifiers.has(identifier)) {
+                    continue;
+                }
+
+                switch (identifier) {
+                    case Mesh.Identifiers.Vert:
+                        const vert = this.getVec3(tokens);
+                        const [x, y, z] = vert;
+                        if (x > this.bounds.maxX) {
+                            this.bounds.maxX = x;
+                        }
+                        if (x < this.bounds.minX) {
+                            this.bounds.minX = x;
+                        }
+                        if (y > this.bounds.maxY) {
+                            this.bounds.maxY = y;
+                        }
+                        if (y < this.bounds.minY) {
+                            this.bounds.minY = y;
+                        }
+                        if (z > this.bounds.maxZ) {
+                            this.bounds.maxZ = z;
+                        }
+                        if (z < this.bounds.minZ) {
+                            this.bounds.minZ = z;
+                        }
+                        this.obj.vertsIn.push(vert);
+                        break;
+                    case Mesh.Identifiers.Texture:
+                        this.obj.uvsIn.push(this.getVec2(tokens));
+                        break;
+                    case Mesh.Identifiers.Normal:
+                        this.obj.normalsIn.push(this.getVec3(tokens));
+                        break;
+                    case Mesh.Identifiers.GroupName:
+                        console.log(`Mesh name ${tokens.shift()}`);
+                        break;
+                    case Mesh.Identifiers.SmoothGroup:
+                        break;
+                    case Mesh.Identifiers.Face:
+                        this.handleFace(tokens);
+                        break;
+                }
+            }
+        }
+
+        handleFace(tokens) {
+            // if the vert, normal, and uv all match
+            // for the given face (e.g. 1/1/1 means use
+            // vert 1, uv 1, normal 1) and we see it a second
+            // time in the data, then we can share the index.
+
+            for (let j = 0; j < tokens.length; j++) {
+                // each point on the face
+                const token = tokens[j];
+                const existingIndex = this.obj.pointIndices[token];
+
+                if (!token) {
+                    // empty string
+                    continue;
+                }
+
+                if (!existingIndex) {
+                    // we've never seen this combination of data
+                    // for the point before, so it's new and we must
+                    // add it to our outputs and also increment the
+                    // index.
+                    this.obj.pointIndices[token] = this.obj.index;
+                    this.obj.index++;
+
+                    const point = this.getPoint(token);
+                    // the point is referencing a line, there are 3 values
+                    // on the line for verts so all three should be pushed.
+                    // this also applies for normals. with uvs it's only 2.
+                    // also, the obj is 1-indexed so we need to subtract 1.
+                    point[0] && this.obj.verts.push(...this.obj.vertsIn[point[0] - 1])
+                    point[1] && this.obj.uvs.push(...this.obj.uvsIn[point[1] - 1]);
+                    point[2] && this.obj.normals.push(...this.obj.normalsIn[point[2] - 1]);
+                }
+
+                // we've already seen this combination of data
+                // which is why we just need to push the index
+                // without adding new output data.
+                this.obj.indices.push(this.obj.pointIndices[token]);
+            }
+        }
+        
+        setupGL(viz) {
+            const { ctx: gl } = viz;
+            const { phong: shader } = viz.state;
+            const { program } = shader;
+
+            viz.setupBuffer(this.gl.positions);
+            viz.setupBuffer(this.gl.uvs);
+            viz.setupBuffer(this.gl.normals);
+            viz.setupBuffer(this.gl.indices, 'ELEMENT_ARRAY_BUFFER');
+
+            // All the vertexAttribArray things associate with this. We can then swap between them
+            // to render to the object, or to render to screen.
+            this.gl.vao = gl.createVertexArray();
+            gl.bindVertexArray(this.gl.vao);
+
+            // Positions
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.gl.positions.buffer);
+            gl.vertexAttribPointer(shader.a_positionLocation, 3, gl.FLOAT, false, 12, 0);
+            gl.enableVertexAttribArray(shader.a_positionLocation);
+            gl.bindBuffer(gl.ARRAY_BUFFER, null);
+
+            // UVs
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.gl.uvs.buffer);
+            gl.vertexAttribPointer(shader.a_uvLocation, 2, gl.FLOAT, false, 8, 0);
+            gl.enableVertexAttribArray(shader.a_uvLocation);
+            gl.bindBuffer(gl.ARRAY_BUFFER, null);
+
+            // Normals
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.gl.normals.buffer);
+            gl.vertexAttribPointer(shader.a_normalLocation, 3, gl.FLOAT, false, 12, 0);
+            gl.enableVertexAttribArray(shader.a_normalLocation);
+            gl.bindBuffer(gl.ARRAY_BUFFER, null);
+
+            this.setupInstancingGL(viz);
+            gl.bindVertexArray(null);
+        }
+
+        async setupTextures(viz) {
+            this.textures.diffuse = await viz.setupTexture(window._assets.scifiBox.diffuse);
+            this.textures.normal = await viz.setupTexture(window._assets.scifiBox.normal);
+            this.textures.metallic = await viz.setupTexture(window._assets.scifiBox.metallic);
+            this.textures.roughness = await viz.setupTexture(window._assets.scifiBox.roughness);
+        }
+
+        setupInstancingGL(viz) {
+            const { count } = this.instancing;
+            const translations = [];
+
+            const width = this.bounds.maxX - this.bounds.minX;
+            const length = this.bounds.maxZ - this.bounds.minZ;
+            const height = this.bounds.maxY - this.bounds.minY;
+
+            for (let i = 0; i < count; i++) {
+                const x = i * width + width * 0.5;
+                // y is up in this case.
+                const y = i * height + height * 0.5;
+                const z = i * length + length * 0.5;
+                translations.push(x, y, z);
+                const xRot = 0;
+                const yRot = 0;
+                const zRot = 0;
+                translations.push(xRot, yRot, zRot);
+            }
+
+            this.instancing.data = new Float32Array(translations);
+
+            {
+                // a 2D grid based on the count.
+                const gridTranslations = [];
+                const startX = -(count * width) * 0.5;
+                const endX = -startX;
+
+                const startY = -(count * height) * 0.5;
+                const endY = -startY;
+
+                const startZ = -(count * length) * 0.5;
+                const endZ = -startZ;
+
+                const offsetX = width * 0.5;
+                const offsetY = height * 0.5;
+                const offsetZ = length * 0.5;
+
+                for (let ty = startY + offsetY; ty < endY; ty += height) {
+                    for (let tx = startX + offsetX; tx < endX; tx += width) {
+                        for (let tz = startZ + offsetZ; tz < endZ; tz += length) {
+                            // y is up in this case.
+                            const x = tx;
+                            const y = ty;
+                            const z = tz;
+                            gridTranslations.push(x, y, z);
+                            const xRot = 0;
+                            const yRot = 0;
+                            const zRot = 0;
+                            gridTranslations.push(xRot, yRot, zRot);
+                        }
+                    }
+                }
+                this.instancing.data = new Float32Array(gridTranslations);
+            }
+        
+            viz.setupBuffer(this.instancing);
+
+            const { ctx: gl } = viz;
+            const { phong: shader } = viz.state;
+
+            // Expecting the VAO to already be setup from 'setupGL'
+            // gl.bindVertexArray(this.gl.vao);
+
+            // Translations per instance
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.instancing.buffer);
+            gl.vertexAttribPointer(shader.a_instance_translationLocation, 3, gl.FLOAT, false, 24, 0);
+            gl.enableVertexAttribArray(shader.a_instance_translationLocation);
+            // Only step forward in this once per instance.
+            gl.vertexAttribDivisor(shader.a_instance_translationLocation, 1);
+
+            gl.vertexAttribPointer(shader.a_instance_rotationLocation, 3, gl.FLOAT, false, 24, 12);
+            gl.enableVertexAttribArray(shader.a_instance_rotationLocation);
+            // Only step forward in this once per instance.
+            gl.vertexAttribDivisor(shader.a_instance_rotationLocation, 1);
+            gl.bindBuffer(gl.ARRAY_BUFFER, null);
+
+            // gl.bindVertexArray(null);
+        }
+
+        handleScale = () => {
+            const { mat4 } = glMatrix;
+            this.modelMatrix = mat4.create();
+            mat4.scale(this.modelMatrix, this.modelMatrix, [this.scale, this.scale, this.scale]);
+        };
+    }
+
+    class Quad {
+        constructor() {
+            this.useOutput = OUTPUT_SHADED_1;
+            this.useEffect = EFFECT_NONE;
+            this.useFilter = FILTER_NONE;
+
+            this.gl = {
+                vao: null,
+                positions: {
+                    data: null,
+                    buffer: null,
+                },
+                uvs: {
+                    data: null,
+                    buffer: null,
+                },
+                indices: {
+                    data: null,
+                    buffer: null,
+                }
+            };
+        }
+
+        setupGL(viz) {
+            const { ctx: gl } = viz;
+            const { quad: shader } = viz.state;
+            const { program } = shader;
+
+            // All the vertexAttribArray things associate with this. We can then swap between them
+            // to render to the object, or to render to screen.
+            this.gl.vao = gl.createVertexArray();
+            gl.bindVertexArray(this.gl.vao);
+
+            // TODO
+            // FIX COORDS.
+            this.gl.positions.data = new Float32Array([
+                // top left
+                -1, 1,
+                // top right
+                1, 1,
+                // bottom left
+                -1, -1,
+                // bottom right
+                1, -1,
+            ]);
+            // this.gl.indices.data = new Uint8Array([0, 1, 2, 2, 1, 3]);
+            this.gl.indices.data = new Uint8Array([2, 1, 0, 3, 1, 2]);
+
+            viz.setupBuffer(this.gl.positions);
+            viz.setupBuffer(this.gl.indices, 'ELEMENT_ARRAY_BUFFER');
+
+            // Positions
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.gl.positions.buffer);
+            gl.vertexAttribPointer(shader.a_positionLocation, 2, gl.FLOAT, false, 8, 0);
+            gl.enableVertexAttribArray(shader.a_positionLocation);
+            gl.bindBuffer(gl.ARRAY_BUFFER, null);
+
+            gl.bindVertexArray(null);
+        }
+    }
+
+    class Viz {
+        constructor() {
+            this.canvas = document.getElementById('canvas');
+            this.ctx = this.canvas.getContext('webgl2', {
+                alpha: true,
+                antialias: true,
+                depth: true,
+                premultipliedAlpha: false,
+                // preserveDrawingBuffer: true,
+            });
+            this.state = {
+                animateCamera: false,
+                animateY: false,
+                deferredRendering: true,
+                timeMod: 0.3,
+                timeModDivisor: 0.001,
+            };
+            this.framebuffer = {
+                object: null,
+                diffuseTexture: null,
+            };
+            this.cameraPosition = new Float32Array([0, 10, 10]);
+            this.setupMatrices();
+            this.setupGL();
+            this.setupShaders();
+            this.setupFramebuffer();
+        }
+
+        setupMatrices = () => {
+            const { mat4, vec3 } = glMatrix;
+
+            this.viewMatrix = mat4.create();
+            // viewer centre, view direction, up
+            const [x, y, z] = this.cameraPosition;
+            mat4.lookAt(this.viewMatrix, vec3.fromValues(x, y, z), vec3.fromValues(0, 0, -1), vec3.fromValues(0, 1, 0));
+
+            this.projectionMatrix = mat4.create();
+            mat4.perspective(this.projectionMatrix, Math.PI / 3, 1, Z_NEAR, Z_FAR);
+        }
+
+        setupGL() {
+            const { ctx: gl } = this;
+            // gl.enable(gl.BLEND);
+            // gl.blendFunc(gl.ONE, gl.ONE);
+            // // Needed for alpha and depth testing.
+            // gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+            // gl.enable(gl.DEPTH_TEST);
+            // gl.depthFunc(gl.LESS);
+            // gl.depthFunc(gl.LEQUAL);
+            
+            gl.enable(gl.DEPTH_TEST);
+            gl.depthFunc(gl.LEQUAL);
+            gl.depthRange(Z_NEAR, Z_FAR);
+            gl.depthMask(true);
+
+            gl.enable(gl.CULL_FACE);
+
+            gl.clearColor(0.0, 0.0, 0.0, 1.0);
+            gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+        }
+
+        async setupTexture(imageData) {
+            const img = await loadImage(imageData);
+
+            const { ctx: gl } = this;
+            const texture = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+            // Both the textures need y-flipping for webgl on unpack
+            gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+            gl.texImage2D(
+                gl.TEXTURE_2D,
+                0,
+                gl.RGBA,
+                img.width,
+                img.height,
+                0,
+                gl.RGBA,
+                gl.UNSIGNED_BYTE,
+                img,
+            );
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+            gl.bindTexture(gl.TEXTURE_2D, null);
+            return texture;
+        }
+
+        setupShaders() {
+            const { ctx: gl } = this;
+            Object.keys(SHADERS).forEach(shaderName => {
+                const { vertex, fragment, uniforms, attributes } = SHADERS[shaderName];
+                this.state[shaderName] = new Shader(gl, vertex, fragment);
+                this.state[shaderName].cacheUniformLocations(gl, uniforms);
+                this.state[shaderName].cacheAttributeLocations(gl, attributes);
+            });
+        }
+
+        setupBuffer(obj, type = 'ARRAY_BUFFER') {
+            const { ctx: gl } = this;
+
+            const bufferType = gl[type];
+            const buffer = gl.createBuffer();
+            gl.bindBuffer(bufferType, buffer);
+            gl.bufferData(bufferType, obj.data, gl.STATIC_DRAW);
+            obj.buffer = buffer;
+        }
+
+        setupFramebuffer() {
+            const { ctx: gl } = this;
+
+            if (!gl.getExtension("EXT_color_buffer_float")) {
+                console.error("FLOAT color buffer not available");
+                // document.body.innerHTML = "This example requires EXT_color_buffer_float which is unavailable on this system."
+            }
+
+            this.framebuffer.object = gl.createFramebuffer();
+            gl.bindFramebuffer(gl.FRAMEBUFFER, this.framebuffer.object);
+
+
+            const createFboTexture = (type) => {
+                const texture = gl.createTexture();
+                
+                gl.bindTexture(gl.TEXTURE_2D, texture);
+
+                gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+                gl.texStorage2D(
+                    gl.TEXTURE_2D,
+                    1,
+                    type,
+                    gl.drawingBufferWidth,
+                    gl.drawingBufferHeight,
+                );
+
+                return texture;
+            }
+            this.framebuffer.positionTexture = createFboTexture(gl.RGBA16F);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.framebuffer.positionTexture, 0);
+            // Only unbind after calling framebufferTexture2D!
+            gl.bindTexture(gl.TEXTURE_2D, null);
+
+            this.framebuffer.uvTexture = createFboTexture(gl.RG16F);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, this.framebuffer.uvTexture, 0);
+            gl.bindTexture(gl.TEXTURE_2D, null);
+
+            this.framebuffer.normalTexture = createFboTexture(gl.RGBA16F);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT2, gl.TEXTURE_2D, this.framebuffer.normalTexture, 0);
+            gl.bindTexture(gl.TEXTURE_2D, null);
+
+            this.framebuffer.diffuseTexture = createFboTexture(gl.RGBA16F);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT3, gl.TEXTURE_2D, this.framebuffer.diffuseTexture, 0);
+            gl.bindTexture(gl.TEXTURE_2D, null);
+
+            this.framebuffer.pbrTexture = createFboTexture(gl.RGBA16F);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT4, gl.TEXTURE_2D, this.framebuffer.pbrTexture, 0);
+            gl.bindTexture(gl.TEXTURE_2D, null);
+
+            this.framebuffer.depthTexture = createFboTexture(gl.DEPTH_COMPONENT16);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, this.framebuffer.depthTexture, 0);
+            gl.bindTexture(gl.TEXTURE_2D, null);
+
+            gl.drawBuffers([
+                gl.COLOR_ATTACHMENT0,
+                gl.COLOR_ATTACHMENT1,
+                gl.COLOR_ATTACHMENT2,
+                gl.COLOR_ATTACHMENT3,
+                gl.COLOR_ATTACHMENT4,
+            ]);
+
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        }
+
+        clear() {
+            const { ctx: gl } = this;
+            gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        }
+
+        drawDeferred(obj, timestamp = 0) {
+            // Draw to offscreen render buffers.
+            const { ctx: gl } = this;
+            const { opacity, colour, useTexture, debugNormals } = obj;
+            const { phong: shader } = this.state;
+            const { program } = shader;
+
+            // // Needed for alpha.
+            // gl.enable(gl.BLEND);
+            // gl.blendFunc(gl.ONE, gl.ONE);
+            // gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+            // Conditionally draw to texture.
+            gl.bindFramebuffer(gl.FRAMEBUFFER, this.state.deferredRendering ? this.framebuffer.object : null)
+            gl.useProgram(program);
+            gl.bindVertexArray(obj.gl.vao);
+
+            // TODO
+            // Use a UBO.
+            gl.uniform1f(shader.u_timeLocation, timestamp);
+            gl.uniform1i(shader.u_animate_cameraLocation, this.state.animateCamera);
+            gl.uniform1i(shader.u_animate_yLocation, this.state.animateY);
+            gl.uniform1i(shader.u_instance_totalLocation, obj.instancing.data.length / 6);
+            gl.uniform1i(shader.u_use_textureLocation, obj.useTexture);
+            gl.uniform3fv(shader.u_colourLocation, obj.colour);
+            gl.uniform1f(shader.u_opacityLocation, obj.opacity);
+
+            // Textures for colour and normals, etc..
+            gl.activeTexture(gl.TEXTURE0);
+            gl.uniform1i(shader.u_texture_diffuseLocation, 0);
+            gl.bindTexture(gl.TEXTURE_2D, obj.textures.diffuse);
+
+            gl.activeTexture(gl.TEXTURE1);
+            gl.uniform1i(shader.u_texture_normalLocation, 1);
+            gl.bindTexture(gl.TEXTURE_2D, obj.textures.normal);
+
+            gl.activeTexture(gl.TEXTURE2);
+            gl.uniform1i(shader.u_texture_metallicLocation, 2);
+            gl.bindTexture(gl.TEXTURE_2D, obj.textures.metallic);
+
+            gl.activeTexture(gl.TEXTURE3);
+            gl.uniform1i(shader.u_texture_roughnessLocation, 3);
+            gl.bindTexture(gl.TEXTURE_2D, obj.textures.roughness);
+
+            // Matrices
+            gl.uniformMatrix4fv(shader.u_model_matrixLocation, false, obj.modelMatrix);
+            gl.uniformMatrix4fv(shader.u_view_matrixLocation, false, this.viewMatrix);
+            gl.uniformMatrix4fv(shader.u_projection_matrixLocation, false, this.projectionMatrix);
+
+            // Indices
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, obj.gl.indices.buffer);
+            // / 6 because we're storing translation and position for each instance which is 6 values.
+            gl.drawElementsInstanced(gl.TRIANGLES, obj.gl.indices.data.length, gl.UNSIGNED_INT, 0, obj.instancing.data.length / 6);
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
+            gl.bindVertexArray(null);
+        }
+
+        drawToQuad(obj, quad) {
+            if (!this.state.deferredRendering) {
+                return;
+            }
+            const { ctx: gl } = this;
+            const { quad: shader } = this.state;
+            const { program } = shader;
+
+            // gl.disable(gl.BLEND);
+            // gl.blendFunc(gl.ONE, gl.ONE);
+
+            // Draw to the main framebuffer.
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            gl.useProgram(program);
+            gl.bindVertexArray(quad.gl.vao);
+
+            // Clear anything that was previously in the screen framebuffer.
+            this.clear();
+
+            gl.uniform3fv(shader.u_colourLocation, obj.colour);
+
+            // This is what we rendered to in the FBO, so we need to use it when drawing back.
+            gl.activeTexture(gl.TEXTURE0);
+            gl.uniform1i(shader.u_buffer_positionLocation, 0);
+            gl.bindTexture(gl.TEXTURE_2D, this.framebuffer.positionTexture);
+            
+            gl.activeTexture(gl.TEXTURE1);
+            gl.uniform1i(shader.u_buffer_uvLocation, 1);
+            gl.bindTexture(gl.TEXTURE_2D, this.framebuffer.uvTexture);
+            
+            gl.activeTexture(gl.TEXTURE2);
+            gl.uniform1i(shader.u_buffer_normalLocation, 2);
+            gl.bindTexture(gl.TEXTURE_2D, this.framebuffer.normalTexture);
+
+            gl.activeTexture(gl.TEXTURE3);
+            gl.uniform1i(shader.u_buffer_diffuseLocation, 3);
+            gl.bindTexture(gl.TEXTURE_2D, this.framebuffer.diffuseTexture);
+
+            gl.activeTexture(gl.TEXTURE4);
+            gl.uniform1i(shader.u_buffer_pbrLocation, 4);
+            gl.bindTexture(gl.TEXTURE_2D, this.framebuffer.pbrTexture);
+
+            gl.activeTexture(gl.TEXTURE5);
+            gl.uniform1i(shader.u_buffer_depthLocation, 5);
+            gl.bindTexture(gl.TEXTURE_2D, this.framebuffer.depthTexture);
+
+            // TODO
+            // Use a UBO.
+            gl.uniform3fv(shader.u_camera_positionLocation, this.cameraPosition);
+            gl.uniform1i(shader.u_use_outputLocation, quad.useOutput);
+            gl.uniform1i(shader.u_use_effectLocation, quad.useEffect);
+            gl.uniform1i(shader.u_use_filterLocation, quad.useFilter);
+
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, quad.gl.indices.buffer);
+            gl.drawElements(gl.TRIANGLES, quad.gl.indices.data.length, gl.UNSIGNED_BYTE, 0);
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
+            gl.bindVertexArray(null);
+
+            // Finished with the last gBuffer result, we can now clear it.
+            gl.bindFramebuffer(gl.FRAMEBUFFER, this.state.deferredRendering ? this.framebuffer.object : null)
+            this.clear();
+        }
+    }
+
+    function setupControls(mesh, viz, quad) {
+        const gui = new dat.GUI();
+        gui.width = gui.width * 1.5;
+
+        const folderViz = gui.addFolder('Visualization');
+        folderViz.open();
+        {
+            const max = 100;
+            const min = -max;
+            const [x, y, z] = viz.cameraPosition;
+            const cameraPosition = { x, y, z };
+            const props = ['x', 'y', 'z'];
+
+            Object.keys(cameraPosition).forEach((p, i) => {
+                const ctl = folderViz.add(cameraPosition, p, min, max, 0.1);
+                ctl.name(`Camera ${p}`);
+                ctl.onChange(() => {
+                    viz.cameraPosition[i] = cameraPosition[p];
+                    viz.setupMatrices();
+                });
+            });
+        }
+        folderViz.add(viz.state, 'animateCamera').name("Animate Camera");
+        folderViz.add(viz.state, 'animateY').name("Animate Y");
+        folderViz.add(viz.state, 'deferredRendering').name("Deferred Rendering");
+        folderViz.add(viz.state, 'timeMod', 0, 2, 0.001).name("Time Modifier");
+
+        const folderMesh = gui.addFolder('Mesh');
+        folderMesh.open();
+        folderMesh.add(
+            mesh,
+            'useTexture',
+            TEXTURE_OPTIONS.reduce((acc, o) => ({ ...acc, [o.name]: o.enum }), {}
+        )).name('Use Texture');
+        folderMesh.add(mesh, 'opacity', 0, 1, 0.01);
+        {
+            const ctl = folderMesh.add(mesh, 'scale', 0, 10, 0.001);
+            ctl.name("Scale");
+            ctl.onChange(mesh.handleScale);
+        }
+
+        const folderQuad = gui.addFolder('Quad');
+        folderQuad.open();
+        folderQuad.add(
+            quad,
+            'useOutput',
+            OUTPUT_OPTIONS.reduce((acc, o) => ({ ...acc, [o.name]: o.enum }), {}
+        )).name('Use Output');
+        folderQuad.add(
+            quad,
+            'useEffect',
+            EFFECT_OPTIONS.reduce((acc, o) => ({ ...acc, [o.name]: o.enum }), {}
+        )).name('Use Effect');
+        folderQuad.add(
+            quad,
+            'useFilter',
+            FILTER_OPTIONS.reduce((acc, o) => ({ ...acc, [o.name]: o.enum }), {}
+        )).name('Use Filter');
+    }
+
+    async function main() {
+        const { width, height } = document.getElementById('canvas');
+        const viz = new Viz();
+        // https://www.cgtrader.com/free-3d-models/industrial/tool/sci-fi-box-game-free
+        const mesh = new Mesh(window._assets.scifiBox.obj);
+        mesh.setupGL(viz);
+        await mesh.setupTextures(viz);
+
+        // Alignment matters here.
+        const floorObj = `
+v 1 0 1
+v -1 0 1
+v -1 0 -1
+v 1 0 -1
+vt 1 1
+vt 1 0
+vt 0 0
+vt 0 1
+vn 0 1 0
+f 1/1/1 2/2/1 3/3/1
+f 3/3/1 2/2/1 1/1/1
+        `;
+        const floor = new Mesh(floorObj)
+        floor.setupGL(viz);
+        floor.modelMatrix[0] = 20;
+        floor.modelMatrix[5] = 20;
+        floor.modelMatrix[10] = 20;
+
+        const quad = new Quad();
+        quad.setupGL(viz);
+
+        setupControls(mesh, viz, quad);
+
+        const update = (timestamp) => {
+            const time = timestamp * viz.state.timeMod * viz.state.timeModDivisor;
+            viz.drawDeferred(mesh, time);
+            // viz.drawDeferred(floor, time);
+            viz.drawToQuad(mesh, quad);
+            window.requestAnimationFrame(update);
+        }
+
+        window.requestAnimationFrame(update);
+    }
+
+    main();
+    </script>
+</html>
